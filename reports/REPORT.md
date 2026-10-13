@@ -1,7 +1,7 @@
 # Lab 25B — Report
 
 **Họ tên / nhóm:** Huỳnh Tấn Trung / 2A202602742
-**Commit:** `<paste-hash>`
+**Commit:** `c37a5e0f026870096fc561415b814c8a330dee83`
 **Điểm tự động:** 80 / 88
 
 > Mọi nhận định phải có số. Dán số từ `reports/gameday/*.json`, `reports/workflows.json`, `reports/slo.json`.

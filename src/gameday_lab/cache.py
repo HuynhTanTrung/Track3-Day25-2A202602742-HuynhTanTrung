@@ -59,7 +59,7 @@ class CacheHit:
     answer: Answer
     similarity: float
     age_s: float
-    fresh: bool  # age_s <= ttl_s; a stale hit may only be served when no provider can answer
+    fresh: bool
 
 
 class SemanticCache:
@@ -72,75 +72,115 @@ class SemanticCache:
         self.max_entries = max_entries
         self.entries: list[Entry] = []
 
+    # ------------------------------------------------------------------ lookup
     def lookup(self, req: Request, now: float) -> CacheHit | None:
-        """TODO(student): the best usable entry for ``req``, or None.
+        # 1. Personal questions are never cacheable — they depend on the user's data.
+        if req.personal:
+            return None
 
-        * personal questions (``req.personal``) are not in the allowlist -> None
-        * drop expired entries (age > ttl_s + max_stale_s)
-        * scope: only entries whose ``answer.prompt_version == req.prompt_version``
-        * best = highest ``cosine(req.embedding, entry.embedding)``; a hit needs
-          similarity >= similarity_threshold
-        * on a hit: set ``entry.last_used = now`` and return
-          CacheHit(answer, similarity, age_s, fresh=age_s <= ttl_s)
-        """
-        raise NotImplementedError("TODO(student): SemanticCache.lookup()")
+        # 2. Drop expired entries (age > ttl + stale window). Mutate in place.
+        horizon = self.ttl_s + self.max_stale_s
+        self.entries = [
+            e for e in self.entries
+            if (now - e.stored_at) <= horizon
+        ]
 
+        # 3. Find the best same-scope candidate by cosine similarity.
+        best: Entry | None = None
+        best_sim = -1.0
+        for e in self.entries:
+            if e.answer.prompt_version != req.prompt_version:
+                continue
+            sim = cosine(req.embedding, e.embedding)
+            if sim > best_sim:
+                best_sim = sim
+                best = e
+
+        if best is None or best_sim < self.similarity_threshold:
+            return None
+
+        # 4. Refresh LRU timestamp, compute age, classify freshness.
+        best.last_used = now
+        age = now - best.stored_at
+        fresh = age <= self.ttl_s
+        return CacheHit(best.answer, best_sim, age, fresh)
+
+    # ------------------------------------------------------------------ store
     def store(self, req: Request, answer: Answer, now: float) -> None:
-        """TODO(student): remember ``answer`` for ``req``.
+        if req.personal:
+            return  # never remember personal data
 
-        * never store personal answers
-        * if an entry in the same scope is already >= similarity_threshold
-          similar, *replace* it (same question: refresh, don't pile up duplicates)
-        * otherwise append; if there are now more than max_entries, evict the
-          least recently used entry (smallest ``last_used``)
-        """
-        raise NotImplementedError("TODO(student): SemanticCache.store()")
+        # If an entry in the same scope is already close enough, refresh it.
+        for e in self.entries:
+            if e.answer.prompt_version != req.prompt_version:
+                continue
+            if cosine(req.embedding, e.embedding) >= self.similarity_threshold:
+                e.embedding = req.embedding
+                e.answer = answer
+                e.stored_at = now
+                e.last_used = now
+                return
 
+        # Otherwise append and evict LRU if over capacity.
+        self.entries.append(Entry(req.embedding, answer, now, now))
+        if len(self.entries) > self.max_entries:
+            lru = min(self.entries, key=lambda e: e.last_used)
+            self.entries.remove(lru)
+
+    # ------------------------------------------------------------------ invalidate
     def invalidate(self, source: str, now: float) -> int:
-        """TODO(student): drop every entry whose ``answer.sources`` contains ``source``; return how many."""
-        raise NotImplementedError("TODO(student): SemanticCache.invalidate()")
+        before = len(self.entries)
+        self.entries = [e for e in self.entries if source not in e.answer.sources]
+        return before - len(self.entries)
 
 
 class CachingClient(BaseClient):
     name = "cached"
 
     def __init__(self, inner: BaseClient, cache: SemanticCache) -> None:
-        """PROVIDED. ``inner`` is your ResilientClient (see factory.build_client("cached"))."""
         self.inner = inner
         self.cache = cache
 
     def on_cancel(self, call: CallContext, tag: Any, now: float) -> None:
-        """PROVIDED."""
         self.inner.on_cancel(call, tag, now)
 
-    # ------------------------------------------------------------------ TODO
+    # ------------------------------------------------------------------ start
     def start(self, call: CallContext, now: float) -> Action:
-        """TODO(student).
+        # FAQ turn only: try a fresh hit first. A fresh hit short-circuits the provider.
+        if call.request is not None:
+            hit = self.cache.lookup(call.request, now)
+            if hit is not None and hit.fresh:
+                return Serve(hit.answer, stale=False)
 
-        * FAQ call (``call.request`` is not None) with a *fresh* hit -> Serve(hit.answer)
-          (no provider is called at all)
-        * otherwise ask ``self.inner.start(...)`` and pass its action through ``_or_stale``
-        """
-        raise NotImplementedError("TODO(student): CachingClient.start()")
+        # Miss (or non-FAQ): let the inner client decide, but apply stale-if-error
+        # in case the very first action is a GiveUp (e.g. all breakers OPEN).
+        action = self.inner.start(call, now)
+        return self._or_stale(call, action, now)
 
+    # ------------------------------------------------------------------ success
     def on_success(self, attempt: Attempt, now: float, latency_s: float) -> None:
-        """TODO(student): tell the inner client first (its breaker needs the result),
-        then store ``attempt.call.answer`` if the call carries a request and an answer."""
-        raise NotImplementedError("TODO(student): CachingClient.on_success()")
+        # Inner first — its breaker needs the latency outcome.
+        self.inner.on_success(attempt, now, latency_s)
 
+        call = attempt.call
+        if call.request is not None and call.answer is not None:
+            self.cache.store(call.request, call.answer, now)
+
+    # ------------------------------------------------------------------ error
     def on_error(self, attempt: Attempt, err: ProviderError, now: float) -> Action:
-        """TODO(student): ``self.inner.on_error(...)``, passed through ``_or_stale``."""
-        raise NotImplementedError("TODO(student): CachingClient.on_error()")
+        action = self.inner.on_error(attempt, err, now)
+        return self._or_stale(attempt.call, action, now)
 
+    # ------------------------------------------------------------------ webhook
     def on_content_update(self, source: str, now: float) -> None:
-        """TODO(student): a document changed (webhook) — invalidate the answers built on it."""
-        raise NotImplementedError("TODO(student): CachingClient.on_content_update()")
+        self.cache.invalidate(source, now)
 
+    # ------------------------------------------------------------------ stale-if-error
     def _or_stale(self, call: CallContext, action: Action, now: float) -> Action:
-        """TODO(student): stale-if-error.
-
-        If ``action`` is a GiveUp and the call is a FAQ call, look the request up
-        *again now* (an invalidation may have happened meanwhile): any hit ->
-        Serve(hit.answer, stale=not hit.fresh). Otherwise return ``action`` unchanged.
-        """
-        raise NotImplementedError("TODO(student): CachingClient._or_stale()")
+        if isinstance(action, GiveUp) and call.request is not None:
+            # Re-lookup now: an invalidation or TTL change may have happened
+            # between the first lookup and the GiveUp.
+            hit = self.cache.lookup(call.request, now)
+            if hit is not None:
+                return Serve(hit.answer, stale=not hit.fresh)
+        return action
